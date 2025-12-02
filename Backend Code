@@ -1,0 +1,257 @@
+# app.py - Flask Backend for Hate Speech Detection
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+import torch
+from transformers import BertTokenizer, BertForSequenceClassification
+import numpy as np
+import lime
+from lime.lime_text import LimeTextExplainer
+import shap
+import re
+import string
+
+app = Flask(__name__)
+CORS(app)
+
+# Global variables for model and tokenizer
+model = None
+tokenizer = None
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+# Class labels
+LABELS = ['hate_speech', 'offensive', 'neither']
+
+def load_model():
+    """Load pre-trained BERT model and tokenizer"""
+    global model, tokenizer
+    
+    print("Loading BERT model and tokenizer...")
+    tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+    model = BertForSequenceClassification.from_pretrained(
+        'bert-base-uncased',
+        num_labels=3
+    )
+    model.to(device)
+    model.eval()
+    print("Model loaded successfully!")
+
+def preprocess_text(text):
+    """Clean and preprocess tweet text"""
+    # Convert to lowercase
+    text = text.lower()
+    
+    # Remove URLs
+    text = re.sub(r'http\S+|www\S+|https\S+', '', text, flags=re.MULTILINE)
+    
+    # Remove user mentions
+    text = re.sub(r'@\w+', '', text)
+    
+    # Remove hashtags (keep the word)
+    text = re.sub(r'#', '', text)
+    
+    # Remove extra whitespace
+    text = ' '.join(text.split())
+    
+    return text
+
+def predict_text(text):
+    """Predict class for given text"""
+    processed_text = preprocess_text(text)
+    
+    # Tokenize
+    inputs = tokenizer(
+        processed_text,
+        return_tensors='pt',
+        max_length=128,
+        padding='max_length',
+        truncation=True
+    )
+    
+    # Move to device
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+    
+    # Get prediction
+    with torch.no_grad():
+        outputs = model(**inputs)
+        logits = outputs.logits
+        probs = torch.softmax(logits, dim=1)
+        predicted_class = torch.argmax(probs, dim=1).item()
+        confidence = probs[0][predicted_class].item()
+    
+    return {
+        'class': LABELS[predicted_class],
+        'confidence': confidence,
+        'probabilities': probs[0].cpu().numpy().tolist()
+    }
+
+def get_attention_weights(text):
+    """Extract attention weights from BERT model"""
+    processed_text = preprocess_text(text)
+    
+    inputs = tokenizer(
+        processed_text,
+        return_tensors='pt',
+        max_length=128,
+        padding='max_length',
+        truncation=True,
+        return_attention_mask=True
+    )
+    
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+    
+    with torch.no_grad():
+        outputs = model(**inputs, output_attentions=True)
+        
+    # Get attention from last layer, average across heads
+    attention = outputs.attentions[-1]  # Last layer
+    attention = attention.mean(dim=1).squeeze(0)  # Average across heads
+    
+    # Get tokens
+    tokens = tokenizer.convert_ids_to_tokens(inputs['input_ids'][0])
+    
+    # Calculate word-level attention scores
+    word_scores = {}
+    for i, token in enumerate(tokens):
+        if token not in ['[CLS]', '[SEP]', '[PAD]']:
+            # Clean token
+            clean_token = token.replace('##', '')
+            if clean_token and clean_token not in string.punctuation:
+                score = attention[0][i].item()  # Attention from [CLS] token
+                word_scores[clean_token] = max(word_scores.get(clean_token, 0), score)
+    
+    return word_scores
+
+def explain_with_lime(text):
+    """Generate LIME explanation"""
+    def predict_proba(texts):
+        """Prediction function for LIME"""
+        probs_list = []
+        for txt in texts:
+            processed = preprocess_text(txt)
+            inputs = tokenizer(
+                processed,
+                return_tensors='pt',
+                max_length=128,
+                padding='max_length',
+                truncation=True
+            )
+            inputs = {k: v.to(device) for k, v in inputs.items()}
+            
+            with torch.no_grad():
+                outputs = model(**inputs)
+                probs = torch.softmax(outputs.logits, dim=1)
+                probs_list.append(probs[0].cpu().numpy())
+        
+        return np.array(probs_list)
+    
+    explainer = LimeTextExplainer(class_names=LABELS)
+    exp = explainer.explain_instance(
+        text,
+        predict_proba,
+        num_features=10,
+        num_samples=100
+    )
+    
+    # Get predicted class
+    prediction = predict_text(text)
+    predicted_idx = LABELS.index(prediction['class'])
+    
+    # Extract word importances
+    word_scores = {}
+    for word, score in exp.as_list(label=predicted_idx):
+        clean_word = word.lower().strip()
+        if clean_word:
+            word_scores[clean_word] = abs(score)
+    
+    return word_scores
+
+def explain_with_shap(text):
+    """Generate SHAP explanation (simplified version)"""
+    # For demo purposes, using a simplified SHAP-like approach
+    # In production, you'd use shap.Explainer with proper setup
+    
+    processed_text = preprocess_text(text)
+    words = processed_text.split()
+    
+    word_scores = {}
+    base_pred = predict_text(text)
+    base_prob = base_pred['confidence']
+    
+    # Calculate importance by masking each word
+    for word in words:
+        if word not in string.punctuation:
+            masked_text = text.replace(word, '[MASK]')
+            masked_pred = predict_text(masked_text)
+            
+            # Importance = change in probability
+            importance = abs(base_prob - masked_pred['confidence'])
+            word_scores[word.lower()] = importance
+    
+    # Normalize scores
+    if word_scores:
+        max_score = max(word_scores.values())
+        if max_score > 0:
+            word_scores = {k: v/max_score for k, v in word_scores.items()}
+    
+    return word_scores
+
+@app.route('/api/predict', methods=['POST'])
+def predict():
+    """Main prediction endpoint"""
+    try:
+        data = request.json
+        text = data.get('text', '')
+        method = data.get('method', 'attention')  # attention, lime, or shap
+        
+        if not text:
+            return jsonify({'error': 'No text provided'}), 400
+        
+        # Get prediction
+        prediction = predict_text(text)
+        
+        # Get explanations based on method
+        if method == 'lime':
+            word_scores = explain_with_lime(text)
+        elif method == 'shap':
+            word_scores = explain_with_shap(text)
+        else:  # attention
+            word_scores = get_attention_weights(text)
+        
+        # Get top keywords
+        sorted_words = sorted(word_scores.items(), key=lambda x: x[1], reverse=True)
+        top_keywords = [word for word, score in sorted_words[:5]]
+        
+        # Generate explanation text
+        if prediction['class'] == 'hate_speech':
+            explanation = f"This text was classified as hate speech with {prediction['confidence']*100:.1f}% confidence. The model detected language targeting protected groups."
+        elif prediction['class'] == 'offensive':
+            explanation = f"This text was classified as offensive with {prediction['confidence']*100:.1f}% confidence. It contains rude or vulgar language but doesn't target protected groups."
+        else:
+            explanation = f"This text was classified as neither hate speech nor offensive with {prediction['confidence']*100:.1f}% confidence."
+        
+        return jsonify({
+            'classification': prediction['class'],
+            'confidence': prediction['confidence'],
+            'probabilities': {
+                'hate_speech': prediction['probabilities'][0],
+                'offensive': prediction['probabilities'][1],
+                'neither': prediction['probabilities'][2]
+            },
+            'explanation': explanation,
+            'keywords': top_keywords,
+            'word_scores': word_scores,
+            'method': method
+        })
+    
+    except Exception as e:
+        print(f"Error: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/health', methods=['GET'])
+def health():
+    """Health check endpoint"""
+    return jsonify({'status': 'healthy', 'model_loaded': model is not None})
+
+if __name__ == '__main__':
+    load_model()
+    app.run(debug=True, host='0.0.0.0', port=5000)
