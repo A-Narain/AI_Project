@@ -1,0 +1,6 @@
+backend/model/
+*.safetensors
+*.pt
+*.h5
+node_modules/
+.env
